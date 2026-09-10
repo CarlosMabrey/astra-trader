@@ -1,0 +1,42 @@
+campaign_id: copyable_alpha_001
+market: solana_pumpfun
+mode: research_only
+live_execution: false
+
+hypothesis: >
+  A subset of historically skilled wallets produces copyable alpha that remains
+  positive after realistic latency, fees, slippage, and out-of-sample testing.
+
+entry_delays_seconds: [1, 5, 10, 30, 60]
+position_sizes_usd: [25, 50, 100, 250, 500]
+
+exit_rules:
+  - {take_profit_pct: 2.0, stop_loss_pct: 2.0, max_hold_seconds: 300}
+  - {take_profit_pct: 3.0, stop_loss_pct: 2.0, max_hold_seconds: 300}
+  - {take_profit_pct: 5.0, stop_loss_pct: 2.5, max_hold_seconds: 900}
+  - {take_profit_pct: 10.0, stop_loss_pct: 5.0, max_hold_seconds: 3600}
+
+validation:
+  chronological_split: true
+  walk_forward: true
+  min_out_of_sample_signals: 1000
+  remove_top_n_trades_test: 3
+  require_positive_median_net_return: true
+  require_positive_outlier_removed_return: true
+  max_drawdown: 0.15
+
+features:
+  - wallet_historical_copyable_return
+  - wallet_recent_copyable_return
+  - wallet_trade_count
+  - wallet_win_rate
+  - token_age_seconds
+  - liquidity_usd
+  - market_cap_usd
+  - volume_velocity
+  - buy_sell_ratio
+  - elite_wallets_10s
+  - elite_wallets_30s
+  - price_momentum_10s
+  - price_momentum_30s
+  - expected_slippage
