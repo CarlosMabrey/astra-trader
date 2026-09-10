@@ -23,8 +23,13 @@ def _pick(columns: set[str], *names: str) -> str:
     raise ValueError(f"Could not resolve any of {names}; available={sorted(columns)}")
 
 
+def _sql_path(path: str | Path) -> str:
+    """Safely quote a filesystem path for DuckDB table-function SQL."""
+    return "'" + str(path).replace("'", "''") + "'"
+
+
 def detect_schema(con: duckdb.DuckDBPyConnection, trades_path: str | Path) -> CorpusSchema:
-    rows = con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(trades_path)]).fetchall()
+    rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet({_sql_path(trades_path)})").fetchall()
     types = {str(r[0]).lower(): str(r[1]).upper() for r in rows}
     cols = set(types)
     wallet = _pick(cols, "wallet", "user", "trader", "signer")
@@ -37,7 +42,11 @@ def detect_schema(con: duckdb.DuckDBPyConnection, trades_path: str | Path) -> Co
 
 def prepare_trades_view(con: duckdb.DuckDBPyConnection, trades_path: str | Path) -> CorpusSchema:
     schema = detect_schema(con, trades_path)
-    side_expr = f"CASE WHEN {schema.side} THEN 'buy' ELSE 'sell' END" if schema.side_is_bool else f"lower(CAST({schema.side} AS VARCHAR))"
+    side_expr = (
+        f"CASE WHEN {schema.side} THEN 'buy' ELSE 'sell' END"
+        if schema.side_is_bool
+        else f"lower(CAST({schema.side} AS VARCHAR))"
+    )
     con.execute(
         f"""
         CREATE OR REPLACE TEMP VIEW trades_norm AS
@@ -47,60 +56,69 @@ def prepare_trades_view(con: duckdb.DuckDBPyConnection, trades_path: str | Path)
             CAST({schema.timestamp} AS DOUBLE) AS ts,
             CAST({schema.price} AS DOUBLE) AS price,
             {side_expr} AS side
-        FROM read_parquet(?)
+        FROM read_parquet({_sql_path(trades_path)})
         WHERE {schema.wallet} IS NOT NULL
           AND {schema.mint} IS NOT NULL
           AND {schema.timestamp} IS NOT NULL
           AND {schema.price} IS NOT NULL
-        """,
-        [str(trades_path)],
+        """
     )
     return schema
 
 
 def rank_candidate_wallets(
     con: duckdb.DuckDBPyConnection,
+    train_end_ts: float,
     min_buys: int = 20,
     max_wallets: int = 5000,
 ) -> list[tuple[str, int]]:
+    """Rank wallets using training-period information only."""
     return con.execute(
         """
         SELECT wallet, count(*) AS buys
         FROM trades_norm
-        WHERE side IN ('buy', 'b', 'true', '1')
+        WHERE side IN ('buy', 'b', 'true', '1') AND ts < ?
         GROUP BY wallet
         HAVING count(*) >= ?
         ORDER BY buys DESC
         LIMIT ?
         """,
-        [min_buys, max_wallets],
+        [train_end_ts, min_buys, max_wallets],
     ).fetchall()
 
 
 def build_copyability_table(
     con: duckdb.DuckDBPyConnection,
     delay_seconds: int,
+    train_end_ts: float,
+    test_end_ts: float | None = None,
     hold_seconds: int = 300,
     wallet_limit: int = 1000,
+    min_training_buys: int = 20,
 ) -> None:
-    """Build one leakage-safe delay table using only prices observed after each decision time.
+    """Build an out-of-sample copyability table.
 
-    Candidate wallets are selected on an earlier chronological training slice. The
-    caller should run this separately per chronological fold before interpreting alpha.
+    Wallets are selected strictly from trades before ``train_end_ts``. Signals are
+    evaluated only at/after ``train_end_ts`` (and before ``test_end_ts`` when set),
+    preventing future wallet performance from leaking into candidate selection.
     """
+    test_bound = "AND t.ts < ?" if test_end_ts is not None else ""
     con.execute(
         """
         CREATE OR REPLACE TEMP TABLE candidate_wallets AS
         SELECT wallet
         FROM trades_norm
-        WHERE side IN ('buy', 'b', 'true', '1')
+        WHERE side IN ('buy', 'b', 'true', '1') AND ts < ?
         GROUP BY wallet
-        HAVING count(*) >= 20
+        HAVING count(*) >= ?
         ORDER BY count(*) DESC
         LIMIT ?
         """,
-        [wallet_limit],
+        [train_end_ts, min_training_buys, wallet_limit],
     )
+    params: list[float] = [train_end_ts]
+    if test_end_ts is not None:
+        params.append(test_end_ts)
     con.execute(
         f"""
         CREATE OR REPLACE TEMP TABLE leader_buys AS
@@ -108,14 +126,14 @@ def build_copyability_table(
         FROM trades_norm t
         JOIN candidate_wallets w USING(wallet)
         WHERE t.side IN ('buy', 'b', 'true', '1')
-        """
+          AND t.ts >= ?
+          {test_bound}
+        """,
+        params,
     )
-    # Correlated arg_min finds the first observed executable reference price at or
-    # after the simulated latency and exit timestamps. This is deliberately more
-    # conservative than using the leader's own fill.
     con.execute(
         f"""
-        CREATE OR REPLACE TEMP TABLE copyability_{delay_seconds}s AS
+        CREATE OR REPLACE TEMP TABLE copyability_{int(delay_seconds)}s AS
         SELECT
             b.wallet,
             b.mint,
